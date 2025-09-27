@@ -11,6 +11,9 @@ import threading
 import time
 import yaml
 import json
+from pathlib import Path
+
+from typing import Any, Dict, Optional, Set, Tuple
 
 from fastapi.responses import StreamingResponse
 from loguru import logger
@@ -33,6 +36,11 @@ async def lifespan(app):
 app = OpenAIStub(lifespan=lifespan)
 xtts = None
 args = None
+
+VOICE_CONFIG_PATH = Path("config/voice_to_speaker.yaml")
+_VOICE_CONFIG_NORMALIZED_WARNING_EMITTED = False
+_VOICE_CONFIG_SUMMARY_EMITTED = False
+_MISSING_MODEL_ERRORS_EMITTED: Set[Tuple[str, str, str]] = set()
 
 def unload_model():
     import torch, gc
@@ -110,24 +118,180 @@ class xtts_wrapper():
                 logger.debug(f"Generated {tokens} tokens in {time.time() - self.last_used:.2f}s @ {tokens / (time.time() - self.last_used):.2f} T/s")
                 self.last_used = time.time()
 
-def default_exists(filename: str):
-    if not os.path.exists(filename):
-        fpath, ext = os.path.splitext(filename)
-        basename = os.path.basename(fpath)
-        default = f"{basename}.default{ext}"
-        
-        logger.info(f"{filename} does not exist, setting defaults from {default}")
+def default_exists(filename: str) -> None:
+    file_path = Path(filename)
+    if not file_path.exists():
+        default = Path(f"{file_path.stem}.default{file_path.suffix}")
 
-        with open(default, 'r', encoding='utf8') as from_file:
-            with open(filename, 'w', encoding='utf8') as to_file:
+        logger.info(f"{file_path} does not exist, setting defaults from {default}")
+
+        with default.open('r', encoding='utf8') as from_file:
+            with file_path.open('w', encoding='utf8') as to_file:
                 to_file.write(from_file.read())
+
+
+def _clean_config_key(value: Any) -> Any:
+    if isinstance(value, str):
+        return value.replace("\ufeff", "").replace("\u200b", "").strip()
+    return value
+
+
+def _normalize_mapping(mapping: Dict[Any, Any]) -> Tuple[Dict[Any, Any], bool]:
+    normalized = False
+    cleaned: Dict[Any, Any] = {}
+
+    for key, value in mapping.items():
+        cleaned_key = _clean_config_key(key)
+        if cleaned_key != key:
+            normalized = True
+
+        if isinstance(value, dict):
+            cleaned_value, child_normalized = _normalize_mapping(value)
+            cleaned[cleaned_key] = cleaned_value
+            normalized = normalized or child_normalized
+        else:
+            cleaned[cleaned_key] = value
+
+    return cleaned, normalized
+
+
+def _resolve_path(path_str: str) -> Path:
+    path = Path(path_str).expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    return path
+
+
+def _missing_model_message(model_name: str, voice_name: str, resolved_path: Path, canonical_voice_code: str) -> str:
+    safe_code = canonical_voice_code.replace("'", "\\'")
+    fix_cmd = (
+        "docker exec -it <container> python3 -c "
+        "\"from pathlib import Path; import piper.download_voices as dl; "
+        f"dl.download_voice('{safe_code}', Path('/app/voices'))\""
+    )
+    return (
+        f"Voice '{voice_name}' for model '{model_name}' model missing: {resolved_path}\n"
+        f"Fix: {fix_cmd}"
+    )
+
+
+def load_voice_config(*, log_summary: bool = False) -> Dict[str, Dict[str, Any]]:
+    global _VOICE_CONFIG_NORMALIZED_WARNING_EMITTED, _VOICE_CONFIG_SUMMARY_EMITTED
+
+    default_exists(str(VOICE_CONFIG_PATH))
+
+    try:
+        with VOICE_CONFIG_PATH.open('r', encoding='utf-8-sig') as file:
+            raw_cfg = yaml.safe_load(file) or {}
+    except yaml.YAMLError as exc:
+        message = f"Failed to parse {VOICE_CONFIG_PATH}: {exc}"
+        logger.error(message)
+        raise BadRequestError(message, param='voice')
+    except FileNotFoundError:
+        message = f"Configuration file missing: {VOICE_CONFIG_PATH}"
+        logger.error(message)
+        raise BadRequestError(message, param='voice')
+
+    if not isinstance(raw_cfg, dict):
+        message = f"{VOICE_CONFIG_PATH} must define a mapping of models to voices."
+        logger.error(message)
+        raise BadRequestError(message, param='voice')
+
+    cleaned_cfg, normalized = _normalize_mapping(raw_cfg)
+    if normalized and not _VOICE_CONFIG_NORMALIZED_WARNING_EMITTED:
+        logger.warning("Config keys normalized due to hidden characters (BOM/ZWSP).")
+        _VOICE_CONFIG_NORMALIZED_WARNING_EMITTED = True
+
+    available_namespaces = {key for key in cleaned_cfg.keys() if isinstance(key, str)}
+    if not available_namespaces.intersection({'tts-1', 'tts-1-hd'}):
+        message = f"{VOICE_CONFIG_PATH} must contain at least one of: tts-1, tts-1-hd."
+        logger.error(message)
+        raise BadRequestError(message, param='model')
+
+    summary_lines = []
+
+    for model_name, voices in cleaned_cfg.items():
+        if not isinstance(model_name, str):
+            continue
+
+        if not isinstance(voices, dict):
+            message = f"Model '{model_name}' in {VOICE_CONFIG_PATH} must map to a dictionary of voices."
+            logger.error(message)
+            raise BadRequestError(message, param='voice')
+
+        if log_summary and not _VOICE_CONFIG_SUMMARY_EMITTED:
+            summary_lines.append(f"{model_name}:")
+
+        for voice_name, config in voices.items():
+            if voice_name == 'default':
+                if log_summary and not _VOICE_CONFIG_SUMMARY_EMITTED:
+                    if isinstance(config, str):
+                        summary_lines.append(f"  - default -> {config}")
+                    else:
+                        summary_lines.append("  - default -> inline configuration")
+                continue
+
+            if not isinstance(config, dict):
+                message = f"Voice '{voice_name}' in model '{model_name}' must be a mapping of settings."
+                logger.error(message)
+                raise BadRequestError(message, param='voice')
+
+            model_path = config.get('model')
+            if not model_path:
+                message = f"Voice '{voice_name}' in model '{model_name}' is missing the 'model' key."
+                logger.error(message)
+                raise BadRequestError(message, param='voice')
+
+            missing_model = None
+            resolved_model_path: Optional[Path] = None
+            if isinstance(model_path, str) and Path(model_path).suffix == '.onnx':
+                resolved_model_path = _resolve_path(model_path)
+                if not resolved_model_path.exists():
+                    canonical_voice_code = (
+                        config.get('download_code')
+                        or config.get('voice_code')
+                        or resolved_model_path.stem
+                    )
+                    missing_model = _missing_model_message(
+                        model_name,
+                        voice_name,
+                        resolved_model_path,
+                        canonical_voice_code,
+                    )
+                    key = (model_name, voice_name, str(resolved_model_path))
+                    if key not in _MISSING_MODEL_ERRORS_EMITTED:
+                        logger.error(missing_model)
+                        _MISSING_MODEL_ERRORS_EMITTED.add(key)
+
+            if log_summary and not _VOICE_CONFIG_SUMMARY_EMITTED:
+                status_bits = []
+                if isinstance(model_path, str) and Path(model_path).suffix == '.onnx':
+                    status_bits.append('model=' + ('ok' if missing_model is None else 'missing'))
+                else:
+                    status_bits.append('model=configured')
+
+                speaker_path = config.get('speaker')
+                if isinstance(speaker_path, str):
+                    resolved_speaker = _resolve_path(speaker_path)
+                    status_bits.append('speaker=' + ('ok' if resolved_speaker.exists() else 'missing'))
+
+                summary_lines.append(f"  - {voice_name}: {', '.join(status_bits)}")
+
+    if log_summary and not _VOICE_CONFIG_SUMMARY_EMITTED:
+        if summary_lines:
+            logger.info("Voice configuration summary:\n%s", "\n".join(summary_lines))
+        else:
+            logger.info("Voice configuration summary: no voices configured")
+        _VOICE_CONFIG_SUMMARY_EMITTED = True
+
+    return cleaned_cfg
 
 # Read pre process map on demand so it can be changed without restarting the server
 def preprocess(raw_input):
     #logger.debug(f"preprocess: before: {[raw_input]}")
     default_exists('config/pre_process_map.yaml')
-    with open('config/pre_process_map.yaml', 'r', encoding='utf8') as file:
-        pre_process_map = yaml.safe_load(file)
+    with open('config/pre_process_map.yaml', 'r', encoding='utf-8-sig') as file:
+        pre_process_map = yaml.safe_load(file) or []
         for a, b in pre_process_map:
             raw_input = re.sub(a, b, raw_input)
     
@@ -136,15 +300,83 @@ def preprocess(raw_input):
     return raw_input
 
 # Read voice map on demand so it can be changed without restarting the server
-def map_voice_to_speaker(voice: str, model: str):
-    default_exists('config/voice_to_speaker.yaml')
-    with open('config/voice_to_speaker.yaml', 'r', encoding='utf8') as file:
-        voice_map = yaml.safe_load(file)
-        try:
-            return voice_map[model][voice]
+def map_voice_to_speaker(voice: str, model: str) -> Tuple[Dict[str, Any], str]:
+    voice_map = load_voice_config()
 
-        except KeyError as e:
-            raise BadRequestError(f"Error loading voice: {voice}, KeyError: {e}", param='voice')
+    if model not in voice_map:
+        available = ', '.join(sorted(voice_map.keys())) or 'none'
+        message = f"Model '{model}' is not configured in {VOICE_CONFIG_PATH}. Available: {available}."
+        logger.error(message)
+        raise BadRequestError(message, param='model')
+
+    namespace = voice_map[model]
+    selected_voice = voice
+    config: Optional[Dict[str, Any]] = None
+
+    if voice == 'default':
+        default_entry = namespace.get('default')
+        if default_entry is None:
+            message = (
+                f"Model '{model}' is missing a 'default' entry while voice='default' was requested."
+            )
+            logger.error(message)
+            raise BadRequestError(message, param='voice')
+
+        if isinstance(default_entry, str):
+            selected_voice = default_entry
+            config = namespace.get(selected_voice)
+            if config is None:
+                message = (
+                    f"Model '{model}' default voice '{selected_voice}' is not defined in {VOICE_CONFIG_PATH}."
+                )
+                logger.error(message)
+                raise BadRequestError(message, param='voice')
+        elif isinstance(default_entry, dict):
+            config = default_entry
+        else:
+            message = (
+                f"Model '{model}' default entry must be a string or mapping, got {type(default_entry).__name__}."
+            )
+            logger.error(message)
+            raise BadRequestError(message, param='voice')
+
+    if config is None:
+        config = namespace.get(selected_voice)
+        if config is None:
+            available = ', '.join(sorted(v for v in namespace.keys() if v != 'default')) or 'none'
+            message = (
+                f"Voice '{voice}' is not configured for model '{model}'. Available voices: {available}."
+            )
+            logger.error(message)
+            raise BadRequestError(message, param='voice')
+
+    if not isinstance(config, dict):
+        message = f"Voice '{selected_voice}' for model '{model}' must be a mapping of settings."
+        logger.error(message)
+        raise BadRequestError(message, param='voice')
+
+    model_path = config.get('model')
+    if not model_path:
+        message = f"Voice '{selected_voice}' for model '{model}' is missing the 'model' key."
+        logger.error(message)
+        raise BadRequestError(message, param='voice')
+
+    if isinstance(model_path, str) and Path(model_path).suffix == '.onnx':
+        resolved_model = _resolve_path(model_path)
+        if not resolved_model.exists():
+            canonical_voice_code = (
+                config.get('download_code')
+                or config.get('voice_code')
+                or resolved_model.stem
+            )
+            message = _missing_model_message(model, selected_voice, resolved_model, canonical_voice_code)
+            key = (model, selected_voice, str(resolved_model))
+            if key not in _MISSING_MODEL_ERRORS_EMITTED:
+                logger.error(message)
+                _MISSING_MODEL_ERRORS_EMITTED.add(key)
+            raise BadRequestError(message, param='voice')
+
+    return dict(config), selected_voice
 
 class GenerateSpeechRequest(BaseModel):
     model: str = "tts-1" # or "tts-1-hd"
@@ -214,7 +446,8 @@ async def generate_speech(request: GenerateSpeechRequest):
 
     # Use piper for tts-1, and if xtts_device == none use for all models.
     if model == 'tts-1' or args.xtts_device == 'none':
-        voice_map = map_voice_to_speaker(voice, 'tts-1')
+        voice_map, resolved_voice = map_voice_to_speaker(voice, 'tts-1')
+        voice = resolved_voice
         try:
             piper_model = voice_map['model']
 
@@ -250,7 +483,8 @@ async def generate_speech(request: GenerateSpeechRequest):
         return StreamingResponse(content=ffmpeg_proc.stdout, media_type=media_type)
     # Use xtts for tts-1-hd
     elif model == 'tts-1-hd':
-        voice_map = map_voice_to_speaker(voice, 'tts-1-hd')
+        voice_map, resolved_voice = map_voice_to_speaker(voice, 'tts-1-hd')
+        voice = resolved_voice
         try:
             tts_model = voice_map.pop('model')
             speaker = voice_map.pop('speaker')
@@ -381,16 +615,36 @@ async def generate_speech(request: GenerateSpeechRequest):
             finally:
                 ffmpeg_proc.stdin.close()
 
+        generator_worker = None  # type: Optional[threading.Thread]
+        out_writer_worker = None  # type: Optional[threading.Thread]
+
+        def cleanup():
+            nonlocal generator_worker, out_writer_worker
+            try:
+                ffmpeg_proc.kill()
+            except Exception as exc:
+                logger.debug("Cleanup: ffmpeg kill failed: %r", exc)
+
+            for name, worker in (
+                ("generator_worker", generator_worker),
+                ("out_writer_worker", out_writer_worker),
+            ):
+                if worker is None:
+                    continue
+                try:
+                    if worker.is_alive():
+                        worker.join(timeout=0.5)
+                except Exception as exc:
+                    logger.debug("Cleanup: %s join failed: %r", name, exc)
+
+            generator_worker = None
+            out_writer_worker = None
+
         generator_worker = threading.Thread(target=generator, daemon=True)
         generator_worker.start()
 
         out_writer_worker = threading.Thread(target=out_writer, daemon=True)
         out_writer_worker.start()
-
-        def cleanup():
-            ffmpeg_proc.kill()
-            del generator_worker
-            del out_writer_worker
 
         return StreamingResponse(content=ffmpeg_proc.stdout, media_type=media_type, background=cleanup)
     else:
@@ -423,10 +677,15 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     default_exists('config/pre_process_map.yaml')
-    default_exists('config/voice_to_speaker.yaml')
 
     logger.remove()
     logger.add(sink=sys.stderr, level=args.log_level)
+
+    try:
+        load_voice_config(log_summary=True)
+    except BadRequestError as exc:
+        logger.error(getattr(exc, 'message', str(exc)))
+        sys.exit(1)
 
     if args.xtts_device != "none":
         import torch

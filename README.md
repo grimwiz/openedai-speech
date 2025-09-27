@@ -39,6 +39,53 @@ Details:
 
 If you find a better voice match for `tts-1` or `tts-1-hd`, please let me know so I can update the defaults.
 
+## Build & Run
+
+```bash
+# Classic builder
+docker build -t ghcr.io/matatonic/openedai-speech .
+docker run --rm -p 8000:8000 ghcr.io/matatonic/openedai-speech
+
+# With BuildKit (faster repeat builds)
+DOCKER_BUILDKIT=1 docker build -t ghcr.io/matatonic/openedai-speech .
+
+# Makefile helpers
+make build        # classic builder
+make build-bk     # BuildKit
+make up           # docker compose up -d
+```
+
+### Docker Compose example
+
+```yaml
+services:
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ghcr.io/matatonic/openedai-speech
+    ports: ["8000:8000"]
+    volumes:
+      - ./voices:/app/voices
+      - ./config:/app/config
+    environment:
+      - ORT_LOG_SEVERITY_LEVEL=3
+      - OMP_NUM_THREADS=1
+      - OPENBLAS_NUM_THREADS=1
+      - MKL_NUM_THREADS=1
+      - NUMEXPR_NUM_THREADS=1
+      - NVIDIA_VISIBLE_DEVICES=all
+    runtime: nvidia
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+```
+
+Mount your customised `config/` and `voices/` directories as volumes. To keep secrets out of the compose file, store them in `.env` or use `env_file:` entries.
+
 ## Recent Changes
 
 Version 0.18.2, 2024-08-16
@@ -187,6 +234,27 @@ bash startup.sh
 
 > On first run, the voice models will be downloaded automatically. This might take a while depending on your network connection.
 
+### Install as a service (systemd)
+
+```bash
+sudo cp deploy/openedai-speech.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now openedai-speech.service
+sudo systemctl status openedai-speech.service
+```
+
+Adjust `WorkingDirectory` in the unit file to match your checkout and store secrets in an `EnvironmentFile=` rather than inside the unit.
+
+### Maintenance & security
+
+* Python dependencies are capped via [`constraints.txt`](constraints.txt) to avoid sudden upgrades. Rebuild the image regularly for patched bases.
+* Run `make audit` (wraps `pip-audit`) before deployment to surface known vulnerabilities.
+* Keep credentials in `.env` files or systemd environment files rather than embedding them in Docker or systemd manifests.
+
+### Troubleshooting
+
+See [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) for fixes to common startup and runtime errors.
+
 ### Option B: Docker Image (*recommended*)
 
 #### Nvidia GPU (cuda)
@@ -194,6 +262,8 @@ bash startup.sh
 ```shell
 docker compose up
 ```
+
+> The compose example above already sets the health check, GPU runtime and thread-affinity environment variables. Run `make up` to launch it in detached mode.
 
 #### AMD GPU (ROCm support)
 
